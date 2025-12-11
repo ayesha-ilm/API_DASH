@@ -19,11 +19,12 @@ if os.path.exists("traffic_training_df_lite.parquet"):
 feature_cols = joblib.load("feature_cols.pkl")
 valid_ntas = df_model["NTAName"].unique().tolist()
 
-
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+POLYGON_PATH = os.path.join(BASE_DIR, "nta_polygons.json")
 # -----------------------------
 # Load ALL official NYC NTAs (geojson → list)
 # -----------------------------
-with open("nta_polygons.json") as f:
+with open(POLYGON_PATH) as f:
     polygons_raw = json.load(f)
 
 all_official_nta_names = [rec["NTAName"] for rec in polygons_raw]
