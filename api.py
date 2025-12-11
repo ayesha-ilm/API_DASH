@@ -5,7 +5,8 @@ import joblib
 import numpy as np
 import os
 import json
-from shapely.geometry import shape, Point
+from rapidfuzz import process, fuzz
+
 
 # -----------------------------
 # Load model + data
@@ -16,36 +17,30 @@ if os.path.exists("traffic_training_df_lite.parquet"):
     df_model = pd.read_parquet("traffic_training_df_lite.parquet")
 
 feature_cols = joblib.load("feature_cols.pkl")
-valid_ntas = df_model["NTAName"].unique()
+valid_ntas = df_model["NTAName"].unique().tolist()
+
 
 # -----------------------------
-# Load lightweight NTA polygons
+# Load ALL official NYC NTAs (geojson → list)
 # -----------------------------
 with open("nta_polygons.json") as f:
-    NTA_POLYGONS = json.load(f)
+    polygons_raw = json.load(f)
 
-def latlon_to_nta(lat, lon):
-    """Returns the NTA name for a given (lat, lon) using shapely geometry."""
-    point = Point(lon, lat)
-    for rec in NTA_POLYGONS:
-        polygon = shape(rec["geometry"])
-        if polygon.contains(point):
-            return rec["NTAName"]
-    return None
+all_official_nta_names = [rec["NTAName"] for rec in polygons_raw]
 
 
 app = FastAPI(
     title="NYC Traffic Speed Prediction API",
-    description="Predict average traffic speed (mph) using an XGBoost model.",
-    version="1.2.0"
+    description="Predict average traffic speed (mph) using an XGBoost model with fuzzy matching for NTAs.",
+    version="1.3.0"
 )
+
 
 # -----------------------------
 # Request schema
 # -----------------------------
 class PredictRequest(BaseModel):
-    lat: float
-    lon: float
+    NTAName: str
     timestamp: str
     num_events: int = 0
     num_closures: int = 0
@@ -55,7 +50,37 @@ class PredictRequest(BaseModel):
 
 
 # -----------------------------
-# Helper: compute lag features
+# Helper: fuzzy match to closest valid NTA
+# -----------------------------
+def fuzzy_match_nta(input_name):
+
+    # If already valid, use as-is
+    if input_name in valid_ntas:
+        return input_name, 100.0
+
+    # Try to match among ALL official NYC NTAs
+    best_official, score_official, _ = process.extractOne(
+        input_name,
+        all_official_nta_names,
+        scorer=fuzz.WRatio
+    )
+
+    # If the user typed something that isn't even close to ANY official NTA
+    if score_official < 60:  
+        return None, score_official
+
+    # Best official → find nearest NTA among model-valid NTAs
+    best_valid, score_valid, _ = process.extractOne(
+        best_official,
+        valid_ntas,
+        scorer=fuzz.WRatio
+    )
+
+    return best_valid, score_valid
+
+
+# -----------------------------
+# Compute lag features
 # -----------------------------
 def compute_lags(nta, ts):
     hist = df_model[df_model["NTAName"] == nta].sort_values("hour")
@@ -71,11 +96,11 @@ def compute_lags(nta, ts):
 
 
 # -----------------------------
-# Diagnostic endpoint
+# Diagnostics
 # -----------------------------
 @app.get("/valid-ntas")
 def list_ntas():
-    return {"valid_ntas": sorted(valid_ntas.tolist())}
+    return {"valid_ntas": sorted(valid_ntas), "count": len(valid_ntas)}
 
 
 # -----------------------------
@@ -84,31 +109,34 @@ def list_ntas():
 @app.post("/predict")
 def predict_speed(req: PredictRequest):
 
-    # 1️⃣ Convert lat/lon → NTA
-    nta = latlon_to_nta(req.lat, req.lon)
-    if nta is None:
-        return {"error": "Coordinates are outside NYC or not inside any NTA polygon."}
+    # 1️⃣ Fuzzy match the NTA
+    matched_nta, score = fuzzy_match_nta(req.NTAName)
 
-    # 2️⃣ Validate NTA exists in model data
-    if nta not in valid_ntas:
-        return {"error": f"NTA '{nta}' exists but was not part of training data."}
+    if matched_nta is None:
+        return {
+            "error": f"No reasonably close NTA found for '{req.NTAName}'",
+            "match_score": score
+        }
 
-    # 3️⃣ Parse timestamp
+    # 2️⃣ Timestamp validation
     ts = pd.to_datetime(req.timestamp, errors="coerce")
     if pd.isna(ts):
         return {"error": "Invalid timestamp format"}
 
-    # 4️⃣ Compute lag features
-    lags = compute_lags(nta, ts)
+    # 3️⃣ Lags
+    lags = compute_lags(matched_nta, ts)
     if lags is None:
-        return {"error": "Insufficient history to compute lag features for this NTA."}
+        return {
+            "error": "Insufficient history to compute lag features",
+            "nta_used": matched_nta
+        }
 
     lag1, lag2, lag3 = lags
 
-    # 5️⃣ Encode NTA
-    nta_code = df_model[df_model["NTAName"] == nta]["nta_code"].iloc[0]
+    # 4️⃣ Encode NTA
+    nta_code = df_model[df_model["NTAName"] == matched_nta]["nta_code"].iloc[0]
 
-    # 6️⃣ Build feature row
+    # 5️⃣ Build feature row
     X_new = pd.DataFrame([{
         "num_events": req.num_events,
         "num_closures": req.num_closures,
@@ -123,13 +151,13 @@ def predict_speed(req: PredictRequest):
         "lag3": lag3
     }])
 
-    # 7️⃣ Predict
+    # 6️⃣ Predict
     pred = float(model.predict(X_new)[0])
 
     return {
-        "lat": req.lat,
-        "lon": req.lon,
-        "NTA_detected": nta,
+        "input_NTA": req.NTAName,
+        "matched_NTA": matched_nta,
+        "match_confidence": score,
         "timestamp": req.timestamp,
         "predicted_speed_mph": pred
     }
