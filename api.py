@@ -3,8 +3,6 @@ from pydantic import BaseModel
 import pandas as pd
 import joblib
 import numpy as np
-import gdown
-
 
 # -----------------------------
 # Load model + data
