@@ -3,12 +3,13 @@ from pydantic import BaseModel
 import pandas as pd
 import joblib
 import numpy as np
-
+import os
 # -----------------------------
 # Load model + data
 # -----------------------------
 model = joblib.load("xgb_traffic_model.pkl")
-df_model = joblib.load("traffic_training_df.pkl")
+if os.path.exists("traffic_training_df_lite.parquet"):
+    df_model = pd.read_parquet("traffic_training_df_lite.parquet")
 feature_cols = joblib.load("feature_cols.pkl")
 valid_ntas = df_model["NTAName"].unique()
 
